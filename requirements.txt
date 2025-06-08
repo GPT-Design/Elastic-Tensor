@@ -1,0 +1,4 @@
+bilby[gw]
+gwpy
+gwosc
+pytest
