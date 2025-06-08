@@ -1,57 +1,39 @@
 """
-Elastic‑Shear Constraint from LIGO/Virgo Strain Files
+Elastic-Shear Constraint from LIGO/Virgo Strain Files
 ====================================================
 
-This standalone script ingests a directory of GW strain time‑series (FITS or HDF5)
-for multiple compact‑binary merger events and performs a joint Bayesian parameter
-estimation to bound the *dimensionless* elastic‑shear parameter
+Standalone script to derive a joint Bayesian upper bound on the dimensionless
+elastic-shear propagation parameter
 
-    mu = G / (rho + P)    [Eq. (17) in the 3T_E update]
+    mu = G / (rho + P)
 
-under the assumption that a non‑zero shear modulus introduces a frequency‑dependent
-phase delay in the waveform propagation:
-
-    phi_corr(f) = 2 * pi * D_L / c * mu * f            (small‑mu limit)
-
-where *D_L* is the luminosity distance returned by the sampler.  The code wraps
-`bilby`’s gravitational‑wave likelihood with a custom phase‑correction function,
-runs nested sampling for each event, and then combines the resulting posteriors
-into a single joint constraint.
+using public compact‑binary events.  A non‑zero shear modulus adds a small
+frequency‑dependent phase delay to GW waveforms; we incorporate that via a
+custom phase correction inside Bilby's likelihood and then merge posteriors
+across events.
 
 Usage
 -----
-::
-
-    python elastic_ligo_fit.py \
-        --events_dir /path/to/strain_files/ \
-        --event_list  GW190521 GW190425 ... \
+    python src/elastic_ligo_fit.py \
+        --events_dir /path/to/strain \
+        --event_list  GW150914 GW190521 \
         --outdir      results/elast \
-        --nlive       1024 \
-        --label       elastic_run
-
-The script auto‑detects FITS vs. HDF5, downloads PSDs on the fly, and will fall
-back to *gracedb* if a strain file is missing locally.
+        --nlive       1024
 
 Dependencies
 ------------
-• bilby >= 2.2.0  (pip install bilby[gw])
-• gwpy, gwosc     (for strain I/O)
+• bilby[gw] ≥ 2.2     (pip install bilby[gw])
+• gwpy, gwosc         (for strain I/O)
 • numpy, scipy, pandas, tqdm
 
-Notes
------
-• Wall‑time: O(1–2 h) per event on a 16‑core desktop with dynesty.
-• Memory:   < 2 GB per worker.
-• Tested on Python 3.11 / CUDA 12; GPU not required but CuPy acceleration
-  is automatically enabled if available.
 """
-
 from __future__ import annotations
+
 import argparse
 import json
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import bilby
 import numpy as np
@@ -63,14 +45,14 @@ from bilby.gw.prior import BBHPriorDict
 from gwpy.timeseries import TimeSeries
 from tqdm import tqdm
 
-###############################################################################
+################################################################################
 # Helper functions
-###############################################################################
+################################################################################
 
-def load_strain(event: str, events_dir: Path) -> dict[str, TimeSeries]:
+def load_strain(event: str, events_dir: Path) -> Dict[str, TimeSeries]:
     """Return a dict {ifo: strain_timeseries} for *event*.
 
-    Attempts to read a local FITS/HDF5 file; if unavailable, downloads via GWOSC.
+    Looks for local FITS/HDF5 strain files; if missing downloads via GWOSC.
     """
     strain_files = list(events_dir.glob(f"{event}_*.*"))
     if not strain_files:
@@ -79,95 +61,87 @@ def load_strain(event: str, events_dir: Path) -> dict[str, TimeSeries]:
         gps = event_gps(event)
         metadata = datasets.alertjson(event)
         ifos = metadata["instruments"]
-        local = {}
+        local: Dict[str, TimeSeries] = {}
         for ifo in ifos:
             fname = download(event, ifo, type="strain", path=str(events_dir))
             local[ifo] = TimeSeries.read(fname)
         return local
 
-    out = {}
+    out: Dict[str, TimeSeries] = {}
     for fp in strain_files:
         if fp.suffix == ".fits":
-            out[fp.stem.split("_")[‑1]] = TimeSeries.read(str(fp), format="fits")
-        else:  # e.g. hdf5
-            out[fp.stem.split("_")[‑1]] = TimeSeries.read(str(fp))
+            out[fp.stem.split("_")[-1]] = TimeSeries.read(str(fp), format="fits")
+        else:
+            out[fp.stem.split("_")[-1]] = TimeSeries.read(str(fp))
     return out
 
 
-def make_interferometers(strain_dict: dict[str, TimeSeries]) -> InterferometerList:
+def make_interferometers(strain_dict: Dict[str, TimeSeries]) -> InterferometerList:
     """Build a Bilby InterferometerList with on‑the‑fly PSD estimation."""
     ifos = InterferometerList([])
-    for ifo, ts in strain_dict.items():
+    for ifo_name, ts in strain_dict.items():
         det = bilby.gw.detector.get_interferometer_with_fake_noise_and_injection(
-            ifo,
+            ifo_name,
             sampling_frequency=ts.sample_rate.value,
-            duration=len(ts)/ts.sample_rate.value,
+            duration=len(ts) / ts.sample_rate.value,
             start_time=ts.t0.value,
             strain_data=ts.value,
         )
         ifos.append(det)
     return ifos
 
-
-###############################################################################
-# Custom phase‑correction wrapper
-###############################################################################
+################################################################################
+# Phase‑correction helpers
+################################################################################
 
 def phase_correction(frequencies: np.ndarray, parameters: dict) -> np.ndarray:
-    """Return extra GW phase in radians for elastic shear (small‑μ limit)."""
+    """Return extra GW phase (radians) for elastic shear (small‑mu limit)."""
     mu = parameters.get("mu", 0.0)
-    distance = parameters.get("luminosity_distance", 1.0)  # [Mpc]
-    c = 2.99792458e5  # km/s
-    # Convert distance to km
+    distance = parameters.get("luminosity_distance", 1.0)  # Mpc
+    c_km_s = 2.99792458e5
     D_km = distance * 3.085677581491367e19 / 1000.0
-    return 2 * np.pi * D_km / c * mu * frequencies
+    return 2 * np.pi * D_km / c_km_s * mu * frequencies
 
 
-def modified_waveform(parameters: dict, waveform_generator: WaveformGenerator):
-    """Return complex frequency‑domain waveform with elastic phase shift."""
-    hp, hc = waveform_generator.frequency_domain_strain(parameters)
-    freqs = waveform_generator.frequency_array
-    phase = phase_correction(freqs, parameters)
-    hp *= np.exp(‑1j * phase)
-    hc *= np.exp(‑1j * phase)
+def modified_waveform(parameters: dict, wfgen: WaveformGenerator):
+    """Inject phase shift into standard frequency‑domain waveform."""
+    hp, hc = wfgen.frequency_domain_strain(parameters)
+    phase = phase_correction(wfgen.frequency_array, parameters)
+    hp *= np.exp(-1j * phase)
+    hc *= np.exp(-1j * phase)
     return hp, hc
 
-
-###############################################################################
+################################################################################
 # Per‑event run
-###############################################################################
+################################################################################
 
 def run_single_event(event: str, events_dir: Path, outdir: Path, nlive: int):
     strain = load_strain(event, events_dir)
     ifos = make_interferometers(strain)
 
-    # Standard BBH priors with extra mu
     priors: PriorDict = BBHPriorDict(aligned_spin=False)
     priors["mu"] = bilby.core.prior.LogUniform(name="mu", minimum=1e‑25, maximum=1e‑12)
 
-    # Waveform generator (frequency‑domain IMRPhenomPv2)
-    waveform_generator = WaveformGenerator(
+    wfgen = WaveformGenerator(
         duration=4,
         sampling_frequency=2048,
         frequency_domain_source_model=bilby.gw.source.lal_binary_black_hole,
         parameter_conversion=generate_all_bbh_parameters,
     )
-
     likelihood = bilby.gw.likelihood.GravitationalWaveTransient(
         interferometers=ifos,
-        waveform_generator=waveform_generator,
+        waveform_generator=wfgen,
         phase_marginalization=True,
         distance_marginalization=True,
         time_marginalization=True,
     )
-    # Inject custom waveform modifier
     likelihood.waveform_generator.frequency_domain_source_model = (
-        lambda p: modified_waveform(p, waveform_generator)
+        lambda p: modified_waveform(p, wfgen)
     )
 
     result = bilby.run_sampler(
-        likelihood=likelihood,
-        priors=priors,
+        likelihood,
+        priors,
         sampler="dynesty",
         nlive=nlive,
         outdir=str(outdir / event),
@@ -178,38 +152,30 @@ def run_single_event(event: str, events_dir: Path, outdir: Path, nlive: int):
     result.save_to_file()
     return result
 
-###############################################################################
-# Joint posterior combination
-###############################################################################
+################################################################################
+# Posterior combination
+################################################################################
 
 def combine_results(result_files: List[Path], outfile: Path):
-    """Combine per‑event posterior samples (importance re‑weight on *mu* only)."""
     import pandas as pd
+    dfs = [bilby.result.read_in_result(str(rf)).posterior[["mu"]] for rf in result_files]
+    pd.concat(dfs, ignore_index=True).to_csv(outfile, index=False)
+    print(f"[elastic] joint posterior → {outfile}")
 
-    dfs = []
-    for rf in result_files:
-        r = bilby.result.read_in_result(str(rf))
-        dfs.append(pd.DataFrame(r.posterior["mu"]))
-    joint = pd.concat(dfs, ignore_index=True)
-    joint.to_csv(outfile, index=False)
-    print(f"[elastic] Joint posterior saved → {outfile}")
-
-###############################################################################
+################################################################################
 # CLI
-###############################################################################
+################################################################################
 
 def main():
     p = argparse.ArgumentParser(description="Elastic‑Shear GW constraint tool")
     p.add_argument("--events_dir", type=Path, required=True)
     p.add_argument("--event_list", nargs="*", default=None,
-                   help="Space‑separated list of event names; if omitted, all files in events_dir are used.")
+                   help="Space‑separated list of event names; defaults to all files in --events_dir")
     p.add_argument("--outdir", type=Path, default=Path("results/elast"))
     p.add_argument("--nlive", type=int, default=1024)
-    p.add_argument("--label", type=str, default="elastic_run")
     args = p.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-
     if args.event_list is None:
         args.event_list = sorted({fp.stem.split("_")[0] for fp in args.events_dir.iterdir()})
 
@@ -218,7 +184,7 @@ def main():
         res = run_single_event(ev, args.events_dir, args.outdir, args.nlive)
         result_files.append(Path(res.outdir) / f"{ev}_result.json")
 
-    combine_results(result_files, args.outdir / f"joint_mu_posterior.csv")
+    combine_results(result_files, args.outdir / "joint_mu_posterior.csv")
 
 
 if __name__ == "__main__":
