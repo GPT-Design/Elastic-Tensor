@@ -120,7 +120,7 @@ def run_single_event(event: str, events_dir: Path, outdir: Path, nlive: int):
     ifos = make_interferometers(strain)
 
     priors: PriorDict = BBHPriorDict(aligned_spin=False)
-    priors["mu"] = bilby.core.prior.LogUniform(name="mu", minimum=1e‑25, maximum=1e‑12)
+    priors["mu"] = bilby.core.prior.LogUniform(name="mu", minimum=1e-25, maximum=1e-12)
 
     wfgen = WaveformGenerator(
         duration=4,
