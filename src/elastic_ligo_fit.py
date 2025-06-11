@@ -30,8 +30,6 @@ Dependencies
 from __future__ import annotations
 
 import argparse
-import json
-import os
 from pathlib import Path
 from typing import List, Dict
 
@@ -56,9 +54,7 @@ def load_strain(event: str, events_dir: Path) -> Dict[str, TimeSeries]:
     """
     strain_files = list(events_dir.glob(f"{event}_*.*"))
     if not strain_files:
-        from gwosc import datasets, event_gps, download
-
-        gps = event_gps(event)
+        from gwosc import datasets, download
         metadata = datasets.alertjson(event)
         ifos = metadata["instruments"]
         local: Dict[str, TimeSeries] = {}
@@ -120,7 +116,7 @@ def run_single_event(event: str, events_dir: Path, outdir: Path, nlive: int):
     ifos = make_interferometers(strain)
 
     priors: PriorDict = BBHPriorDict(aligned_spin=False)
-    priors["mu"] = bilby.core.prior.LogUniform(name="mu", minimum=1e‑25, maximum=1e‑12)
+    priors["mu"] = bilby.core.prior.LogUniform(name="mu", minimum=1e-25, maximum=1e-12)
 
     wfgen = WaveformGenerator(
         duration=4,
